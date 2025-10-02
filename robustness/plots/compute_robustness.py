@@ -63,13 +63,79 @@ def text_to_clamped_list(s: str) -> List[float]:
 
 from typing import Iterable, List, Tuple
 
+def simple_mean(values: Iterable[Number]) -> float:
+    """
+    Return the arithmetic mean of the provided values.
+    """
+    total = 0.0
+    count = 0
+    for v in values:
+        total += float(v)
+        count += 1
+    if count == 0:
+        raise ValueError("simple_mean() requires at least one value.")
+    return total / count
+
+def median_with_ci(values: Iterable[Number], num_bootstrap: int = 10000, rng_seed: int = 42) -> Tuple[float, float, float]:
+    """
+    Compute the sample median and an approximate 95% CI via bootstrap.
+    Returns (median, ci_lower, ci_upper).
+    """
+    data = [float(v) for v in values]
+    if not data:
+        raise ValueError("median_with_ci() requires at least one value.")
+    data_sorted = sorted(data)
+    n = len(data_sorted)
+
+    # Sample median
+    mid = n // 2
+    if n % 2 == 1:
+        median = data_sorted[mid]
+    else:
+        median = 0.5 * (data_sorted[mid - 1] + data_sorted[mid])
+
+    # Bootstrap CI
+    rng = np.random.default_rng(rng_seed)
+    boot_medians = []
+    for _ in range(num_bootstrap):
+        sample = rng.choice(data_sorted, size=n, replace=True)
+        s_sorted = np.sort(sample)
+        m = n // 2
+        if n % 2 == 1:
+            boot_medians.append(float(s_sorted[m]))
+        else:
+            boot_medians.append(float(0.5 * (s_sorted[m - 1] + s_sorted[m])))
+
+    ci_lower = float(np.percentile(boot_medians, 2.5))
+    ci_upper = float(np.percentile(boot_medians, 97.5))
+    return median, ci_lower, ci_upper
+
+def mean_with_ci(values: Iterable[Number], num_bootstrap: int = 10000, rng_seed: int = 42) -> Tuple[float, float, float]:
+    """
+    Compute the sample mean and an approximate 95% CI via bootstrap.
+    Returns (mean, ci_lower, ci_upper).
+    """
+    data = [float(v) for v in values]
+    if not data:
+        raise ValueError("mean_with_ci() requires at least one value.")
+    n = len(data)
+    sample_mean = float(sum(data) / n)
+
+    rng = np.random.default_rng(rng_seed)
+    boot_means = []
+    for _ in range(num_bootstrap):
+        sample = rng.choice(data, size=n, replace=True)
+        boot_means.append(float(sample.mean()))
+    ci_lower = float(np.percentile(boot_means, 2.5))
+    ci_upper = float(np.percentile(boot_means, 97.5))
+    return sample_mean, ci_lower, ci_upper
 def severity_tail_score(
     values: Iterable[float],
     cap: float = 100.0,      # L in the paper
     threshold: float = 20.0, # T in the paper
     alpha: float = 1.0,
     return_weights: bool = False
-) -> float | Tuple[float, List[float]]:
+) -> Union[float, Tuple[float, List[float]]]:
     """
     Compute S = (1/N) * sum_i w_i, where
       w_i = max(0, (min(L, m_i) - T) / (L - T)) ** alpha
@@ -143,6 +209,8 @@ print(llama_teacher_mlps)
 
 total_drops_llama_teacher = llama_teacher_heads + llama_teacher_mlps
 print(f"Llama teacher: {severity_tail_score(total_drops_llama_teacher)}")
+mean_llama_teacher, ll_t_lo, ll_t_hi = mean_with_ci(total_drops_llama_teacher)
+print(f"Llama teacher (mean, 95% CI): {mean_llama_teacher:.4f} [{ll_t_lo:.4f}, {ll_t_hi:.4f}]")
 # ============================================
 data_llama_student_heads = {
   "(0, 0)": 90.19313049316406,
@@ -699,6 +767,10 @@ total_drops_llama_student = llama_student_heads + llama_student_mlps
 print(f"Llama student: {severity_tail_score(total_drops_llama_student)}")
 print(f"===LLAMA DIFF===")
 print(abs(severity_tail_score(total_drops_llama_student) - severity_tail_score(total_drops_llama_teacher)))
+mean_llama_student, ll_s_lo, ll_s_hi = mean_with_ci(total_drops_llama_student)
+print(f"Llama student (mean, 95% CI): {mean_llama_student:.4f} [{ll_s_lo:.4f}, {ll_s_hi:.4f}]")
+print(f"===LLAMA MEAN DIFF===")
+print(abs(mean_llama_student - mean_llama_teacher))
 
 
 
@@ -878,6 +950,8 @@ gpt2_teacher_mlps = text_to_clamped_list(data_gpt2_teacher_mlps)
 
 total_drops_gpt2_teacher = gpt2_teacher_heads + gpt2_teacher_mlps
 print(f"gpt2 teacher: {severity_tail_score(total_drops_gpt2_teacher)}")
+mean_gpt2_teacher, gpt2_t_lo, gpt2_t_hi = mean_with_ci(total_drops_gpt2_teacher)
+print(f"gpt2 teacher (mean, 95% CI): {mean_gpt2_teacher:.4f} [{gpt2_t_lo:.4f}, {gpt2_t_hi:.4f}]")
 # ============================================
 data_gpt2_student_heads = {
   "(0, 0)": 103.1674,
@@ -969,3 +1043,7 @@ total_drops_gpt2_student = gpt2_student_heads + gpt2_student_mlps
 print(f"gpt2 student: {severity_tail_score(total_drops_gpt2_student)}")
 print(f"===gpt2 DIFF===")
 print(abs(severity_tail_score(total_drops_gpt2_student) - severity_tail_score(total_drops_gpt2_teacher)))
+mean_gpt2_student, gpt2_s_lo, gpt2_s_hi = mean_with_ci(total_drops_gpt2_student)
+print(f"gpt2 student (mean, 95% CI): {mean_gpt2_student:.4f} [{gpt2_s_lo:.4f}, {gpt2_s_hi:.4f}]")
+print(f"===gpt2 MEAN DIFF===")
+print(abs(mean_gpt2_student - mean_gpt2_teacher))

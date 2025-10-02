@@ -1313,18 +1313,6 @@ print(abs(mean_bert_student - mean_bert_teacher))
 
 
 
-
-
-
-
-
-
-
-
-
-
-# ========= Pairwise compression & slope summary (append this block) =========
-
 # Param counts (teacher vs student)
 MODEL_PARAMS = {
     "GPT2":  {"teacher": 124_000_000,  "student":  82_000_000},
@@ -1423,13 +1411,11 @@ for r in results:
         f"{r['beta_sev']:12.3f}{r['pp_per_0.1C_sev']:10.3f}"
     )
 
-# Helper one-liners you may want in the paper text:
 min_p01 = min(r["pp_per_0.1C_mean"] for r in results)
 max_p01 = max(r["pp_per_0.1C_mean"] for r in results)
 print("\nRange of brittleness increase per 0.1C (mean-drop metric): "
       f"{min_p01:.2f}–{max_p01:.2f} pp per 0.1C")
 
-# If you also want CIs for the slope (mean-based), scale the delta CI by 1/C:
 for r in results:
     C = r["C_frac"]
     if C > 0:

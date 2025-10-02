@@ -1047,3 +1047,393 @@ mean_gpt2_student, gpt2_s_lo, gpt2_s_hi = mean_with_ci(total_drops_gpt2_student)
 print(f"gpt2 student (mean, 95% CI): {mean_gpt2_student:.4f} [{gpt2_s_lo:.4f}, {gpt2_s_hi:.4f}]")
 print(f"===gpt2 MEAN DIFF===")
 print(abs(mean_gpt2_student - mean_gpt2_teacher))
+
+
+
+
+
+
+import numpy as np
+from typing import Dict, Iterable, List, Tuple, Union
+import ast
+
+Number = Union[int, float]
+
+# ---------- Helpers ----------
+
+def _clamp_0_100(x: Number) -> float:
+    """Clamp x to [0, 100]."""
+    x = float(x)
+    if x < 0.0:
+        return 0.0
+    if x > 100.0:
+        return 100.0
+    return x
+
+def complement_after_clamp(x: Number) -> float:
+    """
+    OLD BEHAVIOR (kept for backward-compat):
+    Apply: clamp x to [0, 100], then return 100 - x.
+    """
+    return 100.0 - _clamp_0_100(x)
+
+def drop_after_clamp(x: Number) -> float:
+    """
+    NEW BEHAVIOR for data that is already a drop percentage:
+    Clamp drop to [0, 100] and return it.
+    """
+    return _clamp_0_100(x)
+
+def _parse_tuple_key(k: Union[str, Tuple[int, int]]) -> Tuple[int, int]:
+    """
+    Accept "(i, j)" as a string or (i, j) as a tuple and return (i, j) as ints.
+    """
+    if isinstance(k, tuple) and len(k) == 2:
+        i, j = k
+        return int(i), int(j)
+    if isinstance(k, str):
+        tup = ast.literal_eval(k)
+        if isinstance(tup, tuple) and len(tup) == 2:
+            i, j = tup
+            return int(i), int(j)
+    raise ValueError(f"Unrecognized key format: {k!r}")
+
+def _looks_like_pair_list(obj) -> bool:
+    """
+    Return True if obj looks like an iterable of length-2 pairs.
+    """
+    if isinstance(obj, (str, bytes, dict)):
+        return False
+    try:
+        it = list(obj)
+    except TypeError:
+        return False
+    if not it:
+        # Treat empty iterable as pair-list compatible.
+        return True
+    return all(isinstance(x, (list, tuple)) and len(x) == 2 for x in it)
+
+# ---------- Public API (backward compatible) ----------
+
+def dict_to_clamped_list(d_or_pairs: Union[
+    Dict[Union[str, Tuple[int, int]], Number],
+    Iterable[Tuple[Union[str, Tuple[int, int]], Number]]
+]) -> List[float]:
+    """
+    Convert structured keyed data into a flat list ordered by (i, j).
+
+    Backward compatible:
+      - OLD format (post-performance): { "(i, j)": val, ... } OR { (i, j): val, ... }
+        -> returns [ 100 - clamp(val), ... ]
+      - NEW format (drop percentages already): [ ((i, j), drop), ... ] or iterable thereof
+        -> returns [ clamp(drop), ... ]
+
+    The result is always sorted by (i, j) in row-major order.
+    """
+    items: List[Tuple[Tuple[int, int], float]] = []
+
+    if isinstance(d_or_pairs, dict):
+        # OLD format: values are post-performance -> complement after clamp
+        for k, v in d_or_pairs.items():
+            ij = _parse_tuple_key(k)
+            items.append((ij, complement_after_clamp(v)))
+    elif _looks_like_pair_list(d_or_pairs):
+        # NEW format: iterable of ((i, j), drop) -> clamp (no complement)
+        for k, v in d_or_pairs:
+            ij = _parse_tuple_key(k)
+            items.append((ij, drop_after_clamp(v)))
+    else:
+        raise TypeError(
+            "dict_to_clamped_list() expects either a dict of keys to values (old format) "
+            "or an iterable of ((i, j), drop) pairs (new format)."
+        )
+
+    items.sort(key=lambda kv: (kv[0][0], kv[0][1]))  # row-major order
+    return [val for _, val in items]
+
+
+def text_to_clamped_list(s_or_pairs: Union[str, Iterable[Tuple[int, Number]]]) -> List[float]:
+    """
+    Convert index-addressed data into a flat list ordered by index.
+
+    Backward compatible:
+      - OLD format (post-performance): multiline string with lines "<index> <value>"
+        -> returns [ 100 - clamp(value), ... ] sorted by index.
+      - NEW format (drop percentages already): iterable of (index, drop)
+        -> returns [ clamp(drop), ... ] sorted by index.
+    """
+    pairs: List[Tuple[int, float]] = []
+
+    if isinstance(s_or_pairs, str):
+        # OLD format: parse "<index> <post-performance>" per line -> complement
+        for line in s_or_pairs.strip().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            idx_str, val_str = line.split(None, 1)
+            idx = int(idx_str)
+            val = complement_after_clamp(float(val_str))
+            pairs.append((idx, val))
+    elif _looks_like_pair_list(s_or_pairs):
+        # NEW format: list/iterable of (index, drop) -> clamp (no complement)
+        for idx, drop in s_or_pairs:
+            pairs.append((int(idx), drop_after_clamp(drop)))
+    else:
+        raise TypeError(
+            "text_to_clamped_list() expects either a string of '<index> <value>' lines (old format) "
+            "or an iterable of (index, drop) pairs (new format)."
+        )
+
+    pairs.sort(key=lambda t: t[0])
+    return [v for _, v in pairs]
+
+# ---------- Stats utilities (unchanged) ----------
+
+def simple_mean(values: Iterable[Number]) -> float:
+    """
+    Return the arithmetic mean of the provided values.
+    """
+    total = 0.0
+    count = 0
+    for v in values:
+        total += float(v)
+        count += 1
+    if count == 0:
+        raise ValueError("simple_mean() requires at least one value.")
+    return total / count
+
+def median_with_ci(values: Iterable[Number], num_bootstrap: int = 10000, rng_seed: int = 42) -> Tuple[float, float, float]:
+    """
+    Compute the sample median and an approximate 95% CI via bootstrap.
+    Returns (median, ci_lower, ci_upper).
+    """
+    data = [float(v) for v in values]
+    if not data:
+        raise ValueError("median_with_ci() requires at least one value.")
+    data_sorted = sorted(data)
+    n = len(data_sorted)
+
+    # Sample median
+    mid = n // 2
+    if n % 2 == 1:
+        median = data_sorted[mid]
+    else:
+        median = 0.5 * (data_sorted[mid - 1] + data_sorted[mid])
+
+    # Bootstrap CI
+    rng = np.random.default_rng(rng_seed)
+    boot_medians = []
+    for _ in range(num_bootstrap):
+        sample = rng.choice(data_sorted, size=n, replace=True)
+        s_sorted = np.sort(sample)
+        m = n // 2
+        if n % 2 == 1:
+            boot_medians.append(float(s_sorted[m]))
+        else:
+            boot_medians.append(float(0.5 * (s_sorted[m - 1] + s_sorted[m])))
+
+    ci_lower = float(np.percentile(boot_medians, 2.5))
+    ci_upper = float(np.percentile(boot_medians, 97.5))
+    return median, ci_lower, ci_upper
+
+def mean_with_ci(values: Iterable[Number], num_bootstrap: int = 10000, rng_seed: int = 42) -> Tuple[float, float, float]:
+    """
+    Compute the sample mean and an approximate 95% CI via bootstrap.
+    Returns (mean, ci_lower, ci_upper).
+    """
+    data = [float(v) for v in values]
+    if not data:
+        raise ValueError("mean_with_ci() requires at least one value.")
+    n = len(data)
+    sample_mean = float(sum(data) / n)
+
+    rng = np.random.default_rng(rng_seed)
+    boot_means = []
+    for _ in range(num_bootstrap):
+        sample = rng.choice(data, size=n, replace=True)
+        boot_means.append(float(sample.mean()))
+    ci_lower = float(np.percentile(boot_means, 2.5))
+    ci_upper = float(np.percentile(boot_means, 97.5))
+    return sample_mean, ci_lower, ci_upper
+
+def severity_tail_score(
+    values: Iterable[float],
+    cap: float = 100.0,      # L in the paper
+    threshold: float = 20.0, # T in the paper
+    alpha: float = 1.0,
+    return_weights: bool = False
+) -> Union[float, Tuple[float, List[float]]]:
+    """
+    Compute S = (1/N) * sum_i w_i, where
+      w_i = max(0, (min(L, m_i) - T) / (L - T)) ** alpha
+
+    Each m_i must be a *drop magnitude* in [0, 100].
+    Using the functions above, both old and new formats produce such lists.
+    """
+    denom = cap - threshold
+    if denom <= 0:
+        raise ValueError("cap must be greater than threshold.")
+
+    w: List[float] = []
+    for v in values:
+        m = max(0.0, float(v))             # ensure non-negative drop magnitude
+        sev = max(0.0, (min(cap, m) - threshold) / denom)
+        w.append(sev ** alpha)
+
+    S = 0.0 if not w else sum(w) / len(w)
+    return (S, w) if return_weights else S
+
+
+
+
+# ============================================
+data_bert_teacher_heads = [((1, 11), np.float64(12.353628383491666)), ((6, 9), np.float64(10.831647418157342)), ((9, 0), np.float64(10.459723977272905)), ((1, 6), np.float64(8.872935311644737)), ((7, 9), np.float64(8.82584984881223)), ((0, 4), np.float64(8.264990407159855)), ((4, 2), np.float64(6.569784703397785)), ((7, 10), np.float64(6.2689173208453575)), ((4, 7), np.float64(5.795128365761892)), ((1, 9), np.float64(5.5644262099553865)), ((6, 10), np.float64(5.553642976383366)), ((8, 0), np.float64(5.411642096529579)), ((7, 5), np.float64(5.171591084544113)), ((5, 8), np.float64(5.161792266350018)), ((5, 2), np.float64(3.7984007247744755)), ((3, 11), np.float64(3.6726998366902297)), ((1, 7), np.float64(3.6659328800805024)), ((3, 6), np.float64(3.0540507699724606)), ((2, 11), np.float64(3.049841626819383)), ((8, 9), np.float64(3.040389638515817)), ((4, 1), np.float64(2.8094433543819575)), ((6, 6), np.float64(2.753511069990766)), ((0, 7), np.float64(2.7459440542739855)), ((3, 0), np.float64(2.7029368185945257)), ((6, 11), np.float64(2.4970484748455424)), ((5, 10), np.float64(2.477039272390369)), ((8, 1), np.float64(2.2146489608320774)), ((0, 8), np.float64(2.1664268918218377)), ((3, 1), np.float64(2.016954302288798)), ((2, 1), np.float64(1.8436835191158574)), ((5, 5), np.float64(1.7990827756064642)), ((5, 3), np.float64(1.7600993897049722)), ((4, 6), np.float64(1.7559262617486415)), ((9, 3), np.float64(1.6791883122494689)), ((4, 11), np.float64(1.588283701527704)), ((9, 2), np.float64(1.5356489097923087)), ((7, 4), np.float64(1.4062307823182296)), ((6, 5), np.float64(1.3911395031013352)), ((0, 2), np.float64(1.3611703005166897)), ((9, 8), np.float64(1.3600128247734933)), ((3, 10), np.float64(1.34686983599982)), ((7, 11), np.float64(1.297054132523956)), ((9, 5), np.float64(1.280111743109924)), ((0, 3), np.float64(1.2486827600081907)), ((2, 0), np.float64(1.2396853179325928)), ((5, 7), np.float64(1.1907957520795653)), ((1, 2), np.float64(1.1171255527258062)), ((9, 7), np.float64(1.0120808489540223)), ((8, 5), np.float64(0.9575845628930435)), ((9, 10), np.float64(0.9130657780170637)), ((8, 11), np.float64(0.8418929615577331)), ((9, 11), np.float64(0.8220605425578009)), ((8, 2), np.float64(0.7732542523495978)), ((0, 9), np.float64(0.7658234966599231)), ((9, 6), np.float64(0.7323876161070109)), ((6, 2), np.float64(0.668767556183214)), ((7, 7), np.float64(0.585913962872997)), ((1, 8), np.float64(0.5738699694703087)), ((10, 1), np.float64(0.5677606827720671)), ((9, 1), np.float64(0.43213459405223587)), ((10, 4), np.float64(0.4074000052967208)), ((7, 2), np.float64(0.39919887391106634)), ((10, 6), np.float64(0.3874137998870042)), ((10, 11), np.float64(0.35616904642042924)), ((7, 6), np.float64(0.35326475765324883)), ((8, 6), np.float64(0.3474980205584455)), ((8, 10), np.float64(0.2551870189361538)), ((10, 9), np.float64(0.15531388973559768)), ((8, 7), np.float64(0.12113202352506125)), ((10, 10), np.float64(0.054781444359330855)), ((10, 7), np.float64(0.006245014855355002)), ((0, 0), 0), ((0, 1), 0), ((0, 5), 0), ((0, 6), 0), ((0, 10), 0), ((0, 11), 0), ((1, 0), 0), ((1, 1), 0), ((1, 3), 0), ((1, 4), 0), ((1, 5), 0), ((1, 10), 0), ((2, 2), 0), ((2, 3), 0), ((2, 4), 0), ((2, 5), 0), ((2, 6), 0), ((2, 7), 0), ((2, 8), 0), ((2, 9), 0), ((2, 10), 0), ((3, 2), 0), ((3, 3), 0), ((3, 4), 0), ((3, 5), 0), ((3, 7), 0), ((3, 8), 0), ((3, 9), 0), ((4, 0), 0), ((4, 3), 0), ((4, 4), 0), ((4, 5), 0), ((4, 8), 0), ((4, 9), 0), ((4, 10), 0), ((5, 0), 0), ((5, 1), 0), ((5, 4), 0), ((5, 6), 0), ((5, 9), 0), ((5, 11), 0), ((6, 0), 0), ((6, 1), 0), ((6, 3), 0), ((6, 4), 0), ((6, 7), 0), ((6, 8), 0), ((7, 0), 0), ((7, 1), 0), ((7, 3), 0), ((7, 8), 0), ((8, 3), 0), ((8, 4), 0), ((8, 8), 0), ((9, 4), 0), ((9, 9), 0), ((10, 0), 0), ((10, 2), 0), ((10, 3), 0), ((10, 5), 0), ((10, 8), 0), ((11, 0), 0), ((11, 1), 0), ((11, 2), 0), ((11, 3), 0), ((11, 4), 0), ((11, 5), 0), ((11, 6), 0), ((11, 7), 0), ((11, 8), 0), ((11, 9), 0), ((11, 10), 0), ((11, 11), 0)]
+data_bert_teacher_mlps = [(4, 100), (5, 100), (10, np.float64(92.3422084610131)), (6, np.float64(84.35447699371798)), (8, np.float64(78.12510848723231)), (11, np.float64(76.67862061701204)), (3, np.float64(73.85975289357552)), (7, np.float64(70.9505211926028)), (9, np.float64(66.13294601810668)), (0, np.float64(48.34196167536193)), (1, 0), (2, 0)]
+bert_teacher_heads=dict_to_clamped_list(data_bert_teacher_heads)
+bert_teacher_mlps = text_to_clamped_list(data_bert_teacher_mlps)
+
+total_drops_bert_teacher = bert_teacher_heads + bert_teacher_mlps
+print(f"bert teacher: {severity_tail_score(total_drops_bert_teacher)}")
+mean_bert_teacher, bert_t_lo, bert_t_hi = mean_with_ci(total_drops_bert_teacher)
+print(f"bert teacher (mean, 95% CI): {mean_bert_teacher:.4f} [{bert_t_lo:.4f}, {bert_t_hi:.4f}]")
+# ============================================
+data_bert_student_heads = [((1, 9), 100), ((2, 9), np.float64(89.08093671576133)), ((4, 9), np.float64(55.41739961949585)), ((1, 4), np.float64(53.1798443029861)), ((2, 8), np.float64(53.01342055141092)), ((2, 10), np.float64(49.572729192326136)), ((1, 8), np.float64(44.53240621769577)), ((0, 0), np.float64(44.34346526957559)), ((2, 4), np.float64(38.090785089285916)), ((3, 9), np.float64(27.806300319486965)), ((2, 5), np.float64(24.535072740479315)), ((1, 10), np.float64(21.79340310927146)), ((2, 0), np.float64(18.06562062282945)), ((0, 10), np.float64(16.509032653400503)), ((0, 7), np.float64(15.273256254139056)), ((0, 2), np.float64(15.254481815927045)), ((1, 3), np.float64(14.561481423794165)), ((1, 5), np.float64(13.420513867819695)), ((4, 4), np.float64(12.123219729034107)), ((2, 3), np.float64(9.219904909102128)), ((0, 9), np.float64(9.209158918548843)), ((1, 1), np.float64(8.690671372196945)), ((4, 8), np.float64(8.169692504197478)), ((2, 7), np.float64(7.812506482803016)), ((1, 2), np.float64(7.347500527167705)), ((4, 3), np.float64(7.182281042741323)), ((0, 6), np.float64(5.993555774920645)), ((3, 11), np.float64(4.964584101141877)), ((3, 0), np.float64(4.955234906458228)), ((1, 6), np.float64(4.835880576552276)), ((2, 2), np.float64(3.552607341861358)), ((4, 1), np.float64(3.2583031259781348)), ((1, 7), np.float64(3.243934707542373)), ((4, 0), np.float64(2.292286418624534)), ((2, 1), np.float64(2.0503740808979654)), ((3, 7), np.float64(2.0465880036027895)), ((3, 10), np.float64(1.7879583970462964)), ((4, 11), np.float64(1.7868340293166307)), ((3, 5), np.float64(1.7231070227209377)), ((4, 5), np.float64(1.7144682590171656)), ((4, 6), np.float64(1.153459782025723)), ((4, 10), np.float64(1.1257500858798397)), ((3, 1), np.float64(0.7151219421565713)), ((3, 2), np.float64(0.512791584146044)), ((2, 6), np.float64(0.17795622195307947)), ((0, 1), 0), ((0, 3), 0), ((0, 4), 0), ((0, 5), 0), ((0, 8), 0), ((0, 11), 0), ((1, 0), 0), ((1, 11), 0), ((2, 11), 0), ((3, 3), 0), ((3, 4), 0), ((3, 6), 0), ((3, 8), 0), ((4, 2), 0), ((4, 7), 0), ((5, 0), 0), ((5, 1), 0), ((5, 2), 0), ((5, 3), 0), ((5, 4), 0), ((5, 5), 0), ((5, 6), 0), ((5, 7), 0), ((5, 8), 0), ((5, 9), 0), ((5, 10), 0), ((5, 11), 0)]
+data_bert_student_mlps = [(0, 100), (1, 100), (2, 100), (3, 100), (4, 100), (5, np.float64(4.980438841302471))]
+bert_student_heads=dict_to_clamped_list(data_bert_student_heads)
+bert_student_mlps = text_to_clamped_list(data_bert_student_mlps)
+
+total_drops_bert_student = bert_student_heads + bert_student_mlps
+print(f"bert student: {severity_tail_score(total_drops_bert_student)}")
+print(f"===bert DIFF===")
+print(abs(severity_tail_score(total_drops_bert_student) - severity_tail_score(total_drops_bert_teacher)))
+mean_bert_student, bert_s_lo, bert_s_hi = mean_with_ci(total_drops_bert_student)
+print(f"bert student (mean, 95% CI): {mean_bert_student:.4f} [{bert_s_lo:.4f}, {bert_s_hi:.4f}]")
+print(f"===bert MEAN DIFF===")
+print(abs(mean_bert_student - mean_bert_teacher))
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ========= Pairwise compression & slope summary (append this block) =========
+
+# Param counts (teacher vs student)
+MODEL_PARAMS = {
+    "GPT2":  {"teacher": 124_000_000,  "student":  82_000_000},
+    "BERT":  {"teacher": 109_000_000,  "student":  66_000_000},
+    "Llama": {"teacher": 8_000_000_000,"student": 4_000_000_000},
+}
+
+def compression_ratio(teacher_params: int, student_params: int) -> float:
+    """Return fraction compressed C \in (0,1]: (P_t - P_s)/P_t."""
+    tp, sp = float(teacher_params), float(student_params)
+    if tp <= 0 or sp <= 0 or sp > tp:
+        # We allow equality just in case; slope will be NaN if C==0.
+        pass
+    return (tp - sp) / tp
+
+def diff_mean_with_ci(teacher_vals, student_vals, num_bootstrap: int = 10000, rng_seed: int = 42):
+    """
+    Bootstrap CI for (mean_student - mean_teacher).
+    """
+    t = np.asarray(list(teacher_vals), dtype=float)
+    s = np.asarray(list(student_vals), dtype=float)
+    rng = np.random.default_rng(rng_seed)
+    n_t, n_s = len(t), len(s)
+    boot = []
+    for _ in range(num_bootstrap):
+        bt = rng.choice(t, size=n_t, replace=True).mean()
+        bs = rng.choice(s, size=n_s, replace=True).mean()
+        boot.append(bs - bt)
+    boot = np.asarray(boot, dtype=float)
+    delta = float(boot.mean())
+    lo, hi = float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
+    return delta, lo, hi
+
+def compute_pair_stats(
+    name: str,
+    teacher_drops,
+    student_drops,
+    teacher_params: int,
+    student_params: int,
+):
+    # Stats on means
+    t_mean, t_lo, t_hi = mean_with_ci(teacher_drops)
+    s_mean, s_lo, s_hi = mean_with_ci(student_drops)
+    d_mean, d_lo, d_hi = diff_mean_with_ci(teacher_drops, student_drops)
+
+    # Stats on severity tail score (deterministic given values)
+    t_sev = severity_tail_score(teacher_drops)
+    s_sev = severity_tail_score(student_drops)
+    d_sev = s_sev - t_sev
+
+    C = compression_ratio(teacher_params, student_params)  # fraction (e.g., 0.5 == 50% compression)
+    beta_mean = d_mean / C if C > 0 else float("nan")
+    beta_sev  = d_sev  / C if C > 0 else float("nan")
+
+    return {
+        "pair": name,
+        "C_frac": C,                         # 0..1
+        "C_pct": 100.0 * C,                  # %
+        "t_mean": t_mean, "s_mean": s_mean,
+        "d_mean": d_mean, "d_mean_lo": d_lo, "d_mean_hi": d_hi,
+        "beta_mean": beta_mean,              # pp per 1.0 C
+        "pp_per_0.1C_mean": beta_mean * 0.1, # pp per 0.1 C
+        "t_sev": t_sev, "s_sev": s_sev,
+        "d_sev": d_sev,
+        "beta_sev": beta_sev,
+        "pp_per_0.1C_sev": beta_sev * 0.1,
+    }
+
+# Collect drops lists you already built above
+PAIR_INPUTS = [
+    ("GPT2",  total_drops_gpt2_teacher,  total_drops_gpt2_student,  MODEL_PARAMS["GPT2"]["teacher"],  MODEL_PARAMS["GPT2"]["student"]),
+    ("BERT",  total_drops_bert_teacher,  total_drops_bert_student,  MODEL_PARAMS["BERT"]["teacher"],  MODEL_PARAMS["BERT"]["student"]),
+    ("Llama", total_drops_llama_teacher, total_drops_llama_student, MODEL_PARAMS["Llama"]["teacher"], MODEL_PARAMS["Llama"]["student"]),
+]
+
+results = [compute_pair_stats(name, t, s, tp, sp) for (name, t, s, tp, sp) in PAIR_INPUTS]
+
+# Pretty print summary table
+hdr = (
+    f"{'Pair':<7}"
+    f"{'C (%)':>7}"
+    f"{'t_mean':>10}{'s_mean':>10}{'Δmean':>10}"
+    f"{'β_mean':>12}{'pp/0.1C':>10}"
+    f"{'t_sev':>10}{'s_sev':>10}{'Δsev':>10}"
+    f"{'β_sev':>12}{'sev/0.1C':>10}"
+)
+print(hdr)
+print("-" * len(hdr))
+for r in results:
+    print(
+        f"{r['pair']:<7}"
+        f"{r['C_pct']:7.1f}"
+        f"{r['t_mean']:10.2f}{r['s_mean']:10.2f}{r['d_mean']:10.2f}"
+        f"{r['beta_mean']:12.2f}{r['pp_per_0.1C_mean']:10.2f}"
+        f"{r['t_sev']:10.3f}{r['s_sev']:10.3f}{r['d_sev']:10.3f}"
+        f"{r['beta_sev']:12.3f}{r['pp_per_0.1C_sev']:10.3f}"
+    )
+
+# Helper one-liners you may want in the paper text:
+min_p01 = min(r["pp_per_0.1C_mean"] for r in results)
+max_p01 = max(r["pp_per_0.1C_mean"] for r in results)
+print("\nRange of brittleness increase per 0.1C (mean-drop metric): "
+      f"{min_p01:.2f}–{max_p01:.2f} pp per 0.1C")
+
+# If you also want CIs for the slope (mean-based), scale the delta CI by 1/C:
+for r in results:
+    C = r["C_frac"]
+    if C > 0:
+        beta_lo = r["d_mean_lo"] / C
+        beta_hi = r["d_mean_hi"] / C
+        print(f"{r['pair']}: β_mean 95% CI = [{beta_lo:.2f}, {beta_hi:.2f}] pp per 1.0C "
+              f"({beta_lo*0.1:.2f}–{beta_hi*0.1:.2f} per 0.1C)")
